@@ -1,0 +1,5 @@
+boto3>=1.26.0
+python-pptx>=0.6.21
+Flask>=2.0.1
+Werkzeug>=2.0.1
+tenacity>=8.0.1
