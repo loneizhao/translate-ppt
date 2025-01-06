@@ -10,8 +10,11 @@ import os
 from flask import Flask, request, render_template, send_file
 from werkzeug.utils import secure_filename
 
+
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+translation_progress = {'current': 0, 'total': 0}
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
@@ -81,64 +84,33 @@ class ThrottledPPTTranslator:
         retry=retry_if_exception_type((boto3.exceptions.Boto3Error, Exception)),
         after=lambda retry_state: logger.info(f"Retry attempt {retry_state.attempt_number}")
     )
-    def translate_text(self, text, target_language):
-        if not text.strip():
-            return text
-
-        try:
-            self.throttler.get_token()
-            
-            system = [{"text": "You are a professional translator. Translate text accurately while preserving formatting. keep abbreviation as English like AWS,Amazon,EC2 etc"}]
-            messages = [
-                {"role": "user", "content": [{"text": f"Do not add anything else, just translate the following text to {target_language}:\n{text}"}]}
-            ]
-            
-            body = {
-                "messages": messages,
-                "system": system,
-                "inferenceConfig": {
-                    "maxTokens": 5000,
-                    "topP": 0.1,
-                    "temperature": 0.01
-                }
- 
-            }
-
-            response = self.bedrock.converse(
-                modelId=self.model_id,
-                **body
-            )
-
-            if 'output' in response and 'message' in response['output']:
-                message_content = response['output']['message']['content']
-                if message_content and len(message_content) > 0:
-                    translated_text = message_content[0]['text'].strip()
-                    logger.info(f"Translated text: {translated_text}")
-                    return translated_text
-            return text
-
-        except Exception as e:
-            self.error_log.append(f"Translation error for text '{text[:100]}...': {str(e)}")
-            logger.error(f"Translation error: {str(e)}")
-            raise
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((boto3.exceptions.Boto3Error, Exception)),
-        after=lambda retry_state: logger.info(f"Retry attempt {retry_state.attempt_number}")
-    )
-    def batch_translate(self, texts, target_language):
+    def translate_texts(self, texts, target_language, batch=True):
+        """
+        Unified translation method that handles both single and batch translations
+        """
         if not texts:
-            return []
+            return [] if batch else ""
 
         try:
             self.throttler.get_token()
             
-            combined_text = "\n---\n".join(texts)
-            system = [{"text": "You are a professional translator. Translate text accurately while preserving formatting."}]
+            if batch:
+                combined_text = "\n---\n".join(texts)
+            else:
+                combined_text = texts
+
+            system = [{
+                "text": ("You are a professional translator. Please follow these rules:\n"
+                        "1. Translate the text accurately while maintaining the original meaning\n"
+                        "2. Preserve all original formatting, including line breaks and spacing\n"
+                        "3. Keep technical terms, product names, and abbreviations in English (e.g., AWS, Amazon, EC2, API, SDK)\n"
+                        "4. Do not add explanations or additional content\n"
+                        "5. Maintain any special characters or symbols as they appear in the source text\n"
+                        "6. Keep numbers, dates, and units in their original format")
+            }]
+
             messages = [
-                {"role": "user", "content": [{"text": f"Translate the following text segments to {target_language}. Each segment is separated by '---':\n\n{combined_text}"}]}
+                {"role": "user", "content": [{"text": f"Translate the following text to {target_language}. Provide only the translation without any additional comments or explanations:\n\n{combined_text}"}]}
             ]
             
             body = {
@@ -147,9 +119,8 @@ class ThrottledPPTTranslator:
                 "inferenceConfig": {
                     "maxTokens": 4096,
                     "topP": 0.1,
-                    "temperature": 0.1
+                    "temperature": 0.01
                 }
-                
             }
 
             response = self.bedrock.converse(
@@ -161,26 +132,32 @@ class ThrottledPPTTranslator:
                 message_content = response['output']['message']['content']
                 if message_content and len(message_content) > 0:
                     response_text = message_content[0]['text'].strip()
-                    translations = [t.strip() for t in response_text.split('---')]
-                    logger.info(f"Batch translations: {translations}")
                     
-                    if len(translations) != len(texts):
-                        logger.warning(f"Mismatch in translation count. Expected {len(texts)}, got {len(translations)}")
-                        while len(translations) < len(texts):
-                            translations.append(texts[len(translations)])
-                        translations = translations[:len(texts)]
-                    
-                    return translations
-            return texts
+                    if batch:
+                        translations = [t.strip() for t in response_text.split('---')]
+                        logger.info(f"Batch translations: {translations}")
+                        
+                        if len(translations) != len(texts):
+                            logger.warning(f"Mismatch in translation count. Expected {len(texts)}, got {len(translations)}")
+                            while len(translations) < len(texts):
+                                translations.append(texts[len(translations)])
+                            translations = translations[:len(texts)]
+                        
+                        return translations
+                    else:
+                        return response_text
+
+            return texts if batch else texts
 
         except Exception as e:
-            self.error_log.append(f"Batch translation error: {str(e)}")
-            logger.error(f"Batch translation error: {str(e)}")
+            error_msg = "Batch translation error: " if batch else "Translation error: "
+            self.error_log.append(f"{error_msg}{str(e)}")
+            logger.error(f"{error_msg}{str(e)}")
             raise
 
     def translate_presentation_with_batching(self, input_file, target_language, batch_size=5):
+        global translation_progress
         try:
-            # 修改输出文件名生成逻辑
             filename, ext = os.path.splitext(input_file)
             output_file = f"{filename}_cn{ext}"
 
@@ -190,6 +167,7 @@ class ThrottledPPTTranslator:
             total_processed = 0
             failed_batches = []
             
+            # Count total items
             total_items = sum(1 for slide in prs.slides 
                             for shape in slide.shapes 
                             if hasattr(shape, "text_frame")
@@ -197,9 +175,12 @@ class ThrottledPPTTranslator:
                             for run in paragraph.runs
                             if run.text.strip())
 
+            # Set initial progress
+            translation_progress['total'] = total_items
+            translation_progress['current'] = 0
+
             logger.info(f"Starting translation of {total_items} text elements")
 
-            # 翻译幻灯片内容
             for slide_index, slide in enumerate(prs.slides):
                 logger.info(f"Processing slide {slide_index + 1}")
                 for shape in slide.shapes:
@@ -212,22 +193,27 @@ class ThrottledPPTTranslator:
                                     
                                     if len(text_batch) >= batch_size:
                                         try:
-                                            translations = self.batch_translate(text_batch, target_language)
+                                            translations = self.translate_texts(text_batch, target_language, batch=True)
                                             for i, translation in enumerate(translations):
                                                 if i < len(text_locations):
                                                     run = text_locations[i][3]
                                                     run.text = translation
                                                     self.set_consistent_font(run, target_language)
                                                     total_processed += 1
+                                                    translation_progress['current'] = total_processed
                                                     logger.info(f"Progress: {total_processed}/{total_items}")
+                                            text_batch = []
+                                            text_locations = []
                                         except Exception as e:
                                             logger.error(f"Failed to translate batch: {e}")
                                             failed_batches.append((text_batch.copy(), text_locations.copy()))
-                                            
+                                            text_batch = []
+                                            text_locations = []
+
             # Process remaining text
             if text_batch:
                 try:
-                    translations = self.batch_translate(text_batch, target_language)
+                    translations = self.translate_texts(text_batch, target_language, batch=True)
                     for i, translation in enumerate(translations):
                         if i < len(text_locations):
                             run = text_locations[i][3]
@@ -238,16 +224,21 @@ class ThrottledPPTTranslator:
                     logger.error(f"Failed to translate final batch: {e}")
                     failed_batches.append((text_batch.copy(), text_locations.copy()))
 
-            # Save translated presentation
             prs.save(output_file)
             return output_file
 
         except Exception as e:
             logger.error(f"Error translating presentation: {str(e)}")
             raise
-
 # Initialize translator
 translator = ThrottledPPTTranslator()
+
+@app.route('/progress')
+def get_progress():
+    return json.dumps({
+        'current': translation_progress['current'],
+        'total': translation_progress['total']
+    })
 
 @app.route('/')
 def index():
@@ -297,6 +288,18 @@ def index():
             .download-btn:hover {
                 color: white;
             }
+            .progress {
+                height: 25px;
+                margin-top: 20px;
+                margin-bottom: 20px;
+            }
+            .progress-bar {
+                transition: width 0.5s ease-in-out;
+                text-align: center;
+                line-height: 25px;
+                color: white;
+                font-weight: bold;
+            }
         </style>
     </head>
     <body>
@@ -310,16 +313,34 @@ def index():
                     <label for="file" class="form-label">Select PPT File:</label>
                     <input type="file" class="form-control" name="file" id="file" accept=".ppt,.pptx" required>
                 </div>
-                
+                <div class="progress">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                        role="progressbar" 
+                        aria-valuenow="0" 
+                        aria-valuemin="0" 
+                        aria-valuemax="100" 
+                        style="width: 0%">
+                        0%
+                    </div>
+                </div>
                 <div class="mb-3">
                     <label for="target_language" class="form-label">Target Language:</label>
                     <select class="form-select" name="target_language" id="target_language">
                         <option value="chinese">Chinese</option>
-                        <option value="japanese">Japanese</option>
-                        <option value="korean">Korean</option>
+                        <option value="japanese">English</option>
                     </select>
                 </div>
                 
+                <div class="mb-3">
+                    <label for="model" class="form-label">Select Model:</label>
+                    <select class="form-select" name="model" id="model">
+                        <option value="us.anthropic.claude-3-5-sonnet-20241022-v2:0">Claude 3 Sonnet</option>
+                        <option value="us.anthropic.claude-3-5-haiku-20241022-v1:0">Claude 3 Haiku</option>
+                        <option value="us.amazon.nova-pro-v1:0">Nova Pro</option>
+                        
+                    </select>
+                </div>
+
                 <button type="submit" class="btn btn-primary btn-translate w-100">
                     <i class="fas fa-translate"></i> Translate
                 </button>
@@ -354,82 +375,141 @@ def index():
                 progress.style.display = 'block';
                 resultSection.style.display = 'none';
                 
+                let progressInterval = setInterval(function() {
+                    fetch('/progress')
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.total > 0) {
+                                const percentage = (data.current / data.total) * 100;
+                                progressBar.style.width = percentage + '%';
+                                progressBar.setAttribute('aria-valuenow', percentage);
+                                progressBar.textContent = Math.round(percentage) + '%';
+                            }
+                        });
+                }, 1000);
+
                 fetch('/translate', {
                     method: 'POST',
                     body: formData
                 })
                 .then(response => {
+                    clearInterval(progressInterval);
+                    
                     if (!response.ok) {
-                        throw new Error('Translation failed');
+                        return response.json().then(data => {
+                            throw new Error(data.error || 'Translation failed');
+                        });
                     }
-                    return response.blob();
+                    
+                    // Get the filename from the Content-Disposition header
+                    const contentDisposition = response.headers.get('Content-Disposition');
+                    const filenameMatch = contentDisposition && contentDisposition.match(/filename="(.+)"/);
+                    const filename = filenameMatch ? filenameMatch[1] : 'translated_file.pptx';
+                    
+                    return response.blob().then(blob => ({blob, filename}));
                 })
-                .then(blob => {
+                .then(({blob, filename}) => {
                     const url = window.URL.createObjectURL(blob);
-                    const filename = document.getElementById('file').files[0].name;
                     downloadBtn.href = url;
-                    downloadBtn.download = 'translated_' + filename;
+                    downloadBtn.download = filename;
                     
                     progress.style.display = 'none';
                     resultSection.style.display = 'block';
+                    
+                    // Automatically trigger download
+                    const tempLink = document.createElement('a');
+                    tempLink.href = url;
+                    tempLink.download = filename;
+                    document.body.appendChild(tempLink);
+                    tempLink.click();
+                    document.body.removeChild(tempLink);
+                    
+                    // Clean up the blob URL after a delay
+                    setTimeout(() => {
+                        window.URL.revokeObjectURL(url);
+                    }, 1000);
                 })
                 .catch(error => {
+                    clearInterval(progressInterval);
                     alert('Error: ' + error.message);
                     progress.style.display = 'none';
                 });
             };
+
         </script>
     </body>
     </html>
     '''
 @app.route('/translate', methods=['POST'])
 def translate_file():
+    input_path = None
+    output_file = None
     try:
         if 'file' not in request.files:
-            return 'No file uploaded', 400
+            return jsonify({'error': 'No file uploaded'}), 400
         
         file = request.files['file']
         target_language = request.form.get('target_language', 'chinese')
+        selected_model = request.form.get('model', 'us.anthropic.claude-3-haiku-20240307-v1:0')
+
+        translator.model_id = selected_model
         
         if file.filename == '':
-            return 'No file selected', 400
+            return jsonify({'error': 'No file selected'}), 400
             
         if not file.filename.endswith(('.ppt', '.pptx')):
-            return 'Invalid file type', 400
+            return jsonify({'error': 'Invalid file type'}), 400
             
-        # 创建唯一的文件名
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = secure_filename(f"{timestamp}_{file.filename}")
         input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
-        # 保存上传的文件
         file.save(input_path)
         
-        # 翻译文件
         output_file = translator.translate_presentation_with_batching(input_path, target_language)
         
-        # 发送文件
+        if not os.path.exists(output_file):
+            raise FileNotFoundError("Translation output file not found")
+
+        # Clean up input file only
+        if input_path and os.path.exists(input_path):
+            os.remove(input_path)
+            logger.info(f"Cleaned up input file: {input_path}")
+
+        # Return the translated file
         return send_file(
             output_file,
             as_attachment=True,
             download_name=f"translated_{file.filename}",
             mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation'
         )
-        
+
     except Exception as e:
-        logger.error(f"Translation error: {str(e)}")
-        return f'Translation failed: {str(e)}', 500
+        logger.error(f"Translation error: {str(e)}", exc_info=True)
+        # Clean up files in case of error
+        try:
+            if input_path and os.path.exists(input_path):
+                os.remove(input_path)
+            if output_file and os.path.exists(output_file):
+                os.remove(output_file)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
+        return jsonify({'error': str(e)}), 500
+
+
     
     finally:
-        # 清理临时文件
+        # Clean up temporary files
         try:
-            if os.path.exists(input_path):
+            if input_path and os.path.exists(input_path):
                 os.remove(input_path)
-            if os.path.exists(output_file):
+                logger.info(f"Cleaned up input file: {input_path}")
+            if output_file and os.path.exists(output_file):
                 os.remove(output_file)
+                logger.info(f"Cleaned up output file: {output_file}")
         except Exception as e:
-            logger.error(f"Error cleaning up files: {e}")
+            logger.error(f"Error cleaning up files: {e}", exc_info=True)
 
-
+            
 if __name__ == '__main__':
     app.run(debug=True)
