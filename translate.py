@@ -7,18 +7,18 @@ from datetime import datetime
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import os
-from flask import Flask, request, render_template, send_file
+from flask import Flask, request, render_template, send_file, jsonify
 from werkzeug.utils import secure_filename
 
 
-
+batch_size=100
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 translation_progress = {'current': 0, 'total': 0}
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
-app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024  # 160MB max file size
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -99,11 +99,14 @@ class ThrottledPPTTranslator:
             else:
                 combined_text = texts
 
+            logger.info(f"Input text to translate: {combined_text[:200]}...") # Show first 200 chars
+            logger.info(f"Target language: {target_language}")
+
             system = [{
                 "text": ("You are a professional translator. Please follow these rules:\n"
                         "1. Translate the text accurately while maintaining the original meaning\n"
                         "2. Preserve all original formatting, including line breaks and spacing\n"
-                        "3. Keep technical terms, product names, and abbreviations in English (e.g., AWS, Amazon, EC2, API, SDK)\n"
+                        "3. Keep technical terms, product names, by understanding you beleive it could be AWS new service , and abbreviations in English (e.g., Amazon SageMaker HyperPod flexible training plans ,AWS, Amazon, EC2, API, SDK)\n"
                         "4. Do not add explanations or additional content\n"
                         "5. Maintain any special characters or symbols as they appear in the source text\n"
                         "6. Keep numbers, dates, and units in their original format")
@@ -123,10 +126,16 @@ class ThrottledPPTTranslator:
                 }
             }
 
+            logger.info("Sending request to Bedrock...")
+            logger.info(f"Using model: {self.model_id}")
+
             response = self.bedrock.converse(
                 modelId=self.model_id,
                 **body
             )
+
+            logger.info("Received response from Bedrock")
+            logger.info(f"Raw response: {json.dumps(response, indent=2)}")
 
             if 'output' in response and 'message' in response['output']:
                 message_content = response['output']['message']['content']
@@ -135,7 +144,11 @@ class ThrottledPPTTranslator:
                     
                     if batch:
                         translations = [t.strip() for t in response_text.split('---')]
-                        logger.info(f"Batch translations: {translations}")
+                        logger.info(f"Successfully processed batch translation")
+                        logger.info(f"Number of translations: {len(translations)}")
+                        logger.info("Sample translations:")
+                        for i, trans in enumerate(translations[:3]):  # Show first 3 translations
+                            logger.info(f"Translation {i+1}: {trans[:100]}...")  # Show first 100 chars
                         
                         if len(translations) != len(texts):
                             logger.warning(f"Mismatch in translation count. Expected {len(texts)}, got {len(translations)}")
@@ -145,25 +158,33 @@ class ThrottledPPTTranslator:
                         
                         return translations
                     else:
+                        logger.info(f"Single translation result: {response_text[:200]}...")  # Show first 200 chars
                         return response_text
 
+            logger.warning("No valid translation in response, returning original text")
             return texts if batch else texts
 
         except Exception as e:
             error_msg = "Batch translation error: " if batch else "Translation error: "
             self.error_log.append(f"{error_msg}{str(e)}")
             logger.error(f"{error_msg}{str(e)}")
+            logger.error(f"Full error details:", exc_info=True)
             raise
 
-    def translate_presentation_with_batching(self, input_file, target_language, batch_size=5):
+    def translate_presentation_with_batching(self, input_file, target_language, batch_size=50):
         global translation_progress
         try:
             filename, ext = os.path.splitext(input_file)
             output_file = f"{filename}_cn{ext}"
 
+            logger.info(f"Starting translation of {input_file} to {output_file}")
+            logger.info(f"Target language: {target_language}")
+            logger.info(f"Batch size: {batch_size}")
+
             prs = Presentation(input_file)
             text_batch = []
             text_locations = []
+            font_sizes = []
             total_processed = 0
             failed_batches = []
             
@@ -175,11 +196,9 @@ class ThrottledPPTTranslator:
                             for run in paragraph.runs
                             if run.text.strip())
 
-            # Set initial progress
+            logger.info(f"Total text elements to translate: {total_items}")
             translation_progress['total'] = total_items
             translation_progress['current'] = 0
-
-            logger.info(f"Starting translation of {total_items} text elements")
 
             for slide_index, slide in enumerate(prs.slides):
                 logger.info(f"Processing slide {slide_index + 1}")
@@ -188,27 +207,37 @@ class ThrottledPPTTranslator:
                         for paragraph in shape.text_frame.paragraphs:
                             for run in paragraph.runs:
                                 if run.text.strip():
+                                    logger.info(f"Original text: {run.text[:100]}...")  # Show first 100 chars
                                     text_batch.append(run.text)
                                     text_locations.append((slide, shape, paragraph, run))
+                                    font_sizes.append(run.font.size if hasattr(run.font, 'size') else None)
                                     
                                     if len(text_batch) >= batch_size:
                                         try:
+                                            logger.info(f"Processing batch of {len(text_batch)} items")
                                             translations = self.translate_texts(text_batch, target_language, batch=True)
                                             for i, translation in enumerate(translations):
                                                 if i < len(text_locations):
                                                     run = text_locations[i][3]
+                                                    original_font_size = font_sizes[i]
+                                                    logger.info(f"Translated text {i+1}: {translation[:100]}...")
                                                     run.text = translation
                                                     self.set_consistent_font(run, target_language)
+                                                    if original_font_size is not None:
+                                                        run.font.size = original_font_size
+                                                        logger.info(f"Restored font size: {original_font_size}")
                                                     total_processed += 1
                                                     translation_progress['current'] = total_processed
                                                     logger.info(f"Progress: {total_processed}/{total_items}")
                                             text_batch = []
                                             text_locations = []
+                                            font_sizes = []
                                         except Exception as e:
                                             logger.error(f"Failed to translate batch: {e}")
                                             failed_batches.append((text_batch.copy(), text_locations.copy()))
                                             text_batch = []
                                             text_locations = []
+                                            font_sizes = []
 
             # Process remaining text
             if text_batch:
@@ -217,8 +246,12 @@ class ThrottledPPTTranslator:
                     for i, translation in enumerate(translations):
                         if i < len(text_locations):
                             run = text_locations[i][3]
+                            original_font_size = font_sizes[i]
                             run.text = translation
                             self.set_consistent_font(run, target_language)
+                            # Restore original font size
+                            if original_font_size is not None:
+                                run.font.size = original_font_size
                             total_processed += 1
                 except Exception as e:
                     logger.error(f"Failed to translate final batch: {e}")
@@ -401,22 +434,27 @@ def index():
                         });
                     }
                     
-                    // Get the filename from the Content-Disposition header
-                    const contentDisposition = response.headers.get('Content-Disposition');
-                    const filenameMatch = contentDisposition && contentDisposition.match(/filename="(.+)"/);
-                    const filename = filenameMatch ? filenameMatch[1] : 'translated_file.pptx';
+                    const originalFileName = document.getElementById('file').files[0].name;
+                    const translatedFileName = `translated_${originalFileName}`;
                     
-                    return response.blob().then(blob => ({blob, filename}));
+                    return response.blob().then(blob => ({
+                        blob: blob,
+                        filename: translatedFileName
+                    }));
                 })
                 .then(({blob, filename}) => {
+                    // Create blob URL
                     const url = window.URL.createObjectURL(blob);
+                    
+                    // Set up download button
                     downloadBtn.href = url;
                     downloadBtn.download = filename;
                     
+                    // Show success message and download button
                     progress.style.display = 'none';
                     resultSection.style.display = 'block';
                     
-                    // Automatically trigger download
+                    // Trigger automatic download
                     const tempLink = document.createElement('a');
                     tempLink.href = url;
                     tempLink.download = filename;
@@ -424,10 +462,21 @@ def index():
                     tempLink.click();
                     document.body.removeChild(tempLink);
                     
-                    // Clean up the blob URL after a delay
+                    // Add click handler for manual download button
+                    downloadBtn.onclick = function(e) {
+                        e.preventDefault();
+                        const newTempLink = document.createElement('a');
+                        newTempLink.href = url;
+                        newTempLink.download = filename;
+                        document.body.appendChild(newTempLink);
+                        newTempLink.click();
+                        document.body.removeChild(newTempLink);
+                    };
+
+                    // Clean up the blob URL after 1 minute
                     setTimeout(() => {
                         window.URL.revokeObjectURL(url);
-                    }, 1000);
+                    }, 60000); // Keep URL valid for 1 minute
                 })
                 .catch(error => {
                     clearInterval(progressInterval);
@@ -435,6 +484,7 @@ def index():
                     progress.style.display = 'none';
                 });
             };
+
 
         </script>
     </body>
@@ -471,16 +521,19 @@ def translate_file():
         if not os.path.exists(output_file):
             raise FileNotFoundError("Translation output file not found")
 
-        # Clean up input file only
+        # Clean up input file
         if input_path and os.path.exists(input_path):
             os.remove(input_path)
             logger.info(f"Cleaned up input file: {input_path}")
 
-        # Return the translated file
+        # Get the original filename without path
+        original_filename = os.path.basename(file.filename)
+        download_name = f"translated_{original_filename}"
+
         return send_file(
             output_file,
             as_attachment=True,
-            download_name=f"translated_{file.filename}",
+            download_name=download_name,
             mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation'
         )
 
@@ -495,20 +548,18 @@ def translate_file():
         except Exception as cleanup_error:
             logger.error(f"Error during cleanup: {cleanup_error}")
         return jsonify({'error': str(e)}), 500
-
-
     
-    finally:
+#    finally:
         # Clean up temporary files
-        try:
-            if input_path and os.path.exists(input_path):
-                os.remove(input_path)
-                logger.info(f"Cleaned up input file: {input_path}")
-            if output_file and os.path.exists(output_file):
-                os.remove(output_file)
-                logger.info(f"Cleaned up output file: {output_file}")
-        except Exception as e:
-            logger.error(f"Error cleaning up files: {e}", exc_info=True)
+#        try:
+#            if input_path and os.path.exists(input_path):
+#                os.remove(input_path)
+#                logger.info(f"Cleaned up input file: {input_path}")
+#            if output_file and os.path.exists(output_file):
+#                os.remove(output_file)
+##                logger.info(f"Cleaned up output file: {output_file}")
+#        except Exception as e:
+#            logger.error(f"Error cleaning up files: {e}", exc_info=True)
 
             
 if __name__ == '__main__':
