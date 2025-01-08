@@ -1,4 +1,4 @@
-boto3>=1.26.0
+boto3>=1.35.85
 python-pptx>=0.6.21
 Flask>=2.0.1
 Werkzeug>=2.0.1
