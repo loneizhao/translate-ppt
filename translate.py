@@ -18,7 +18,7 @@ translation_progress = {'current': 0, 'total': 0}
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
-app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024  # 160MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 1600 * 1024 * 1024  # 1600MB max file size
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
